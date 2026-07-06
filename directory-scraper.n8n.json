@@ -1,0 +1,128 @@
+{
+  "name": "Directory Scraper — Inspect, Save & Scheduled Run",
+  "active": false,
+  "version": 1,
+  "settings": {},
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "b1a10001-0000-4000-8000-000000000001",
+      "name": "\u25b6 Setup (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-360, -120]
+    },
+    {
+      "parameters": {
+        "jsCode": "// EDIT ME. One place to define the site config + profile name.\n// This same 'request' object is what /inspect, /profiles and /run expect.\nreturn [{\n  json: {\n    profile_name: \"freight_az\",\n    request: {\n      url: \"https://YOUR-DIRECTORY.example.com/list?page=1\",\n      format: \"json\",\n      max_pages: 25,\n      delay: 1.0,\n      min_repeat: 5,\n      render: false,\n      wait: null,\n      row_selector: null,      // e.g. \".listing-card\" once /inspect shows you the block\n      col_selectors: null,     // e.g. {\"name\": \".title\", \"phone\": \".tel\"}\n      next_selector: null      // e.g. \"a.next\" if auto-detect misses it\n    }\n  }\n}];"
+      },
+      "id": "b1a10001-0000-4000-8000-000000000002",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-140, -120]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://directory-scraper:8000/inspect",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {}
+      },
+      "id": "b1a10001-0000-4000-8000-000000000003",
+      "name": "Inspect",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [80, -120]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://directory-scraper:8000/profiles/{{ $('Config').item.json.profile_name }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Config').item.json.request) }}",
+        "options": {}
+      },
+      "id": "b1a10001-0000-4000-8000-000000000004",
+      "name": "Save Profile",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [300, -120]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      },
+      "id": "b1a10001-0000-4000-8000-000000000005",
+      "name": "\ud83d\udd52 Daily 6am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-360, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// EDIT ME. Which saved profile to run + any per-run overrides.\nreturn [{\n  json: {\n    profile_name: \"freight_az\",\n    max_pages: 25,\n    format: \"json\",\n    async_job: false   // set true for very large directories (then add a poll loop)\n  }\n}];"
+      },
+      "id": "b1a10001-0000-4000-8000-000000000006",
+      "name": "Run Settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-140, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://directory-scraper:8000/run/{{ $json.profile_name }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ max_pages: $json.max_pages, format: $json.format, async_job: $json.async_job }) }}",
+        "options": {}
+      },
+      "id": "b1a10001-0000-4000-8000-000000000007",
+      "name": "Run Profile",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [80, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalise the response into a flat count + records passthrough.\n// Wire a 'Split Out' node after this on 'records' to fan out to Sheets/DB/email.\nconst res = $json;\nconst records = res.records || [];\nreturn [{\n  json: {\n    count: res.count != null ? res.count : records.length,\n    pages: res.pages || null,\n    mode: res.mode || null,\n    records\n  }\n}];"
+      },
+      "id": "b1a10001-0000-4000-8000-000000000008",
+      "name": "Summarize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [300, 160]
+    }
+  ],
+  "connections": {
+    "\u25b6 Setup (manual)": {
+      "main": [[{ "node": "Config", "type": "main", "index": 0 }]]
+    },
+    "Config": {
+      "main": [[{ "node": "Inspect", "type": "main", "index": 0 }]]
+    },
+    "Inspect": {
+      "main": [[{ "node": "Save Profile", "type": "main", "index": 0 }]]
+    },
+    "\ud83d\udd52 Daily 6am": {
+      "main": [[{ "node": "Run Settings", "type": "main", "index": 0 }]]
+    },
+    "Run Settings": {
+      "main": [[{ "node": "Run Profile", "type": "main", "index": 0 }]]
+    },
+    "Run Profile": {
+      "main": [[{ "node": "Summarize", "type": "main", "index": 0 }]]
+    }
+  }
+}

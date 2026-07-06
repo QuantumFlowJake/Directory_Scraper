@@ -1,0 +1,20 @@
+services:
+  scraper:
+    build:
+      context: .
+      args:
+        # flip to "true" to bake in Playwright for JS-rendered sites
+        WITH_PLAYWRIGHT: "false"
+    image: directory-scraper:latest
+    container_name: directory-scraper
+    ports:
+      - "8000:8000"
+    volumes:
+      # profiles + job history persist here across restarts/rebuilds
+      - scraper-data:/data
+    environment:
+      - SCRAPER_DB=/data/scraper.db
+    restart: unless-stopped
+
+volumes:
+  scraper-data:

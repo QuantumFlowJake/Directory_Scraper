@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.db
+.venv/
+venv/
+.git/
+.gitignore
+*.md
+output.csv
+output.json
+directory-scraper.n8n.json
