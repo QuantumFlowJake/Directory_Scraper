@@ -86,6 +86,35 @@ def _signature(tag: Tag) -> str:
     return f"{tag.name}.{classes}"
 
 
+def _table_row_selector(soup: BeautifulSoup, min_repeat: int) -> Optional[str]:
+    """Prefer a semantic <table> body when one has enough data rows. A <tr> is
+    a purpose-built "one record per row" signal - stronger than any guessed
+    class - and accessible directories (e.g. many .edu sites) often render
+    plain, unclassed <tr>/<td> rows with `headers` attributes instead.
+    """
+    best: Optional[tuple[Tag, int]] = None
+    for table in soup.find_all("table"):
+        container = table.find("tbody") or table
+        rows = [tr for tr in container.find_all("tr", recursive=False) if tr.find("td")]
+        if len(rows) < min_repeat:
+            continue
+        if best is None or len(rows) > best[1]:
+            best = (table, len(rows))
+    if best is None:
+        return None
+
+    table = best[0]
+    table_id = table.get("id")
+    table_cls = table.get("class")
+    if table_id:
+        table_part = f"table#{table_id}"
+    elif table_cls:
+        table_part = f"table.{'.'.join(table_cls)}"
+    else:
+        table_part = "table"
+    return f"{table_part} tbody tr" if table.find("tbody") else f"{table_part} tr"
+
+
 def detect_row_selector(soup: BeautifulSoup, min_repeat: int) -> Optional[str]:
     """Find the most common classed-tag signature that repeats at least min_repeat times.
 
@@ -94,6 +123,10 @@ def detect_row_selector(soup: BeautifulSoup, min_repeat: int) -> Optional[str]:
     listing's per-item links/labels usually outnumber the rows that wrap them,
     which would otherwise win on raw repeat count alone.
     """
+    table_selector = _table_row_selector(soup, min_repeat)
+    if table_selector:
+        return table_selector
+
     counts: dict[str, int] = {}
     first_seen: dict[str, Tag] = {}
     for tag in soup.find_all(True):
@@ -141,6 +174,33 @@ def _selector_for(child: Tag) -> str:
     return child.name
 
 
+def _table_col_selectors(row: Tag) -> dict:
+    """A <td headers="name"> cell already carries its own authoritative field
+    name (used for accessible header/cell association) - use it verbatim
+    instead of guessing from class/text, and skip the FIELD_HINTS pass
+    entirely so distinct concepts that happen to share a hint keyword (e.g.
+    a person's "name" vs. their job "title") aren't conflated.
+    """
+    cols: dict[str, str] = {}
+    used_names: set[str] = set()
+    for td in row.find_all("td"):
+        headers = td.get("headers")
+        text = td.get_text(strip=True)
+        if not headers or not text:
+            continue
+        # bs4 treats `headers` as multi-valued (like `class`), always a list
+        headers_str = " ".join(headers) if isinstance(headers, list) else headers
+        name = re.sub(r"[^a-z0-9]+", "_", headers_str.strip().lower()).strip("_") or "field"
+        base_name = name
+        suffix = 2
+        while name in used_names:
+            name = f"{base_name}_{suffix}"
+            suffix += 1
+        used_names.add(name)
+        cols[name] = f'td[headers="{headers_str}"]'
+    return cols
+
+
 def detect_col_selectors(row: Tag) -> dict:
     """Guess field names for descendants of a row using common naming hints,
     falling back to the element's own class name (e.g. "author") rather than a
@@ -148,6 +208,10 @@ def detect_col_selectors(row: Tag) -> dict:
     considered when they carry a `title` attribute - a common pattern for
     truncated labels, e.g. <a title="Full Name">Full N...</a>.
     """
+    table_cols = _table_col_selectors(row)
+    if table_cols:
+        return table_cols
+
     candidates = []
     used_selectors = set()
     for child in row.find_all(True):
