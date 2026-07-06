@@ -210,7 +210,7 @@ form.addEventListener('submit', async (e) => {
 
 @app.get("/ui", response_class=HTMLResponse)
 def ui():
-    return UI_HTML
+    return HTMLResponse(UI_HTML, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/inspect")
