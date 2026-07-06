@@ -2,6 +2,8 @@
 
 Endpoints (match the n8n workflow in directory-scraper.n8n.json):
   GET    /                    health check
+  GET    /ui                  single-page form: paste a URL, download a CSV
+  POST   /scrape              one-shot: url in, auto-detected CSV out
   POST   /inspect             fetch a URL, return detected selectors + a sample
   GET    /profiles            list saved profiles
   GET    /profiles/{name}     get one saved profile
@@ -27,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
 import scrape_directory as sd
@@ -48,6 +50,13 @@ class ScrapeRequest(BaseModel):
     row_selector: Optional[str] = None
     col_selectors: Optional[dict] = None
     next_selector: Optional[str] = None
+
+
+class QuickScrapeRequest(BaseModel):
+    url: str
+    max_pages: int = 25
+    delay: float = 1.0
+    render: bool = False
 
 
 class RunOverrides(BaseModel):
@@ -105,6 +114,95 @@ def _startup() -> None:
 @app.get("/")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/scrape")
+def quick_scrape(req: QuickScrapeRequest):
+    """One-shot scrape: give it a URL, get a CSV back. No profile, no
+    manual selectors - uses the same auto-detection as /inspect."""
+    config = sd.ScrapeConfig(url=req.url, max_pages=req.max_pages, delay=req.delay, render=req.render)
+    try:
+        result = sd.scrape(config)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return PlainTextResponse(
+        sd.records_to_csv(result["records"]),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="contacts.csv"'},
+    )
+
+
+UI_HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Directory Scraper</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  input[type=url] { width: 100%; padding: 0.6rem; font-size: 1rem; box-sizing: border-box; }
+  button { margin-top: 0.75rem; padding: 0.6rem 1.2rem; font-size: 1rem; cursor: pointer; }
+  #status { margin-top: 1rem; color: #555; white-space: pre-wrap; }
+  #status.error { color: #b00020; }
+  details { margin-top: 1rem; color: #555; }
+</style>
+</head>
+<body>
+<h1>Directory Scraper</h1>
+<p>Paste the URL of a directory-style listing page. It'll auto-detect the rows,
+follow pagination, and download a CSV of everything it finds.</p>
+<form id="f">
+  <input type="url" id="url" placeholder="https://example.com/directory" required>
+  <details>
+    <summary>Advanced</summary>
+    <label>Max pages <input type="number" id="max_pages" value="25" min="1" style="width:5rem"></label>
+    <label style="margin-left:1rem">Delay (sec) <input type="number" id="delay" value="1" min="0" step="0.5" style="width:5rem"></label>
+  </details>
+  <button type="submit">Scrape</button>
+</form>
+<div id="status"></div>
+<script>
+const form = document.getElementById('f');
+const statusEl = document.getElementById('status');
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const url = document.getElementById('url').value;
+  const max_pages = Number(document.getElementById('max_pages').value) || 25;
+  const delay = Number(document.getElementById('delay').value) || 1;
+  statusEl.className = '';
+  statusEl.textContent = 'Scraping... this can take a while for many pages.';
+  try {
+    const resp = await fetch('/scrape', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url, max_pages, delay}),
+    });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.detail || ('HTTP ' + resp.status));
+    }
+    const blob = await resp.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'contacts.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    statusEl.textContent = 'Done - check your downloads.';
+  } catch (err) {
+    statusEl.className = 'error';
+    statusEl.textContent = 'Failed: ' + err.message;
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    return UI_HTML
 
 
 @app.post("/inspect")

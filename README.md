@@ -25,6 +25,10 @@ This builds the image and starts the service on `http://localhost:8000`,
 persisting profiles/jobs to a named volume (`scraper-data`) mounted at
 `/data`.
 
+**Quickest path to a CSV:** open **http://localhost:8000/ui** in a browser,
+paste in the directory's URL, and click Scrape. It auto-detects everything
+and downloads a `contacts.csv` — no curl, no profiles, no selectors.
+
 To enable Playwright (for JS-rendered sites, via `render: true`), rebuild
 with:
 
@@ -74,6 +78,8 @@ All endpoints accept/return JSON unless noted.
 | Method | Path                | Description                                    |
 |--------|---------------------|-------------------------------------------------|
 | GET    | `/`                 | Health check                                   |
+| GET    | `/ui`                | Single-page form: paste a URL, download a CSV  |
+| POST   | `/scrape`            | One-shot: url in, auto-detected CSV out         |
 | POST   | `/inspect`           | Fetch a URL, return detected selectors + sample |
 | GET    | `/profiles`          | List saved profiles                            |
 | GET    | `/profiles/{name}`   | Get one saved profile                          |
@@ -82,6 +88,21 @@ All endpoints accept/return JSON unless noted.
 | POST   | `/run/{name}`        | Run a saved profile, sync or async             |
 | GET    | `/jobs/{job_id}`     | Poll an async job                              |
 | GET    | `/jobs`              | List recent jobs                               |
+
+### Example: one-shot scrape (no profile needed)
+
+```bash
+curl -X POST http://localhost:8000/scrape \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com/directory"}' \
+  -o contacts.csv
+```
+
+Auto-detects rows/columns/pagination exactly like `/inspect`, follows all
+pages up to `max_pages` (default 25), and always returns a CSV file. This is
+what `/ui` calls under the hood. Good for a first try on any given
+directory; if the results look wrong (see the `/inspect` caveats below),
+switch to a saved profile with explicit overrides instead.
 
 ### Example: inspect a site
 
