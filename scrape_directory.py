@@ -54,6 +54,7 @@ class ScrapeConfig:
     row_selector: Optional[str] = None
     col_selectors: Optional[dict] = None
     next_selector: Optional[str] = None
+    split_name: bool = False
 
 
 def fetch_html(url: str, render: bool, wait: Optional[str]) -> str:
@@ -292,7 +293,50 @@ def detect_next_selector(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 
-def extract_record(row: Tag, col_selectors: dict) -> dict:
+# Common multi-word surname particles (Spanish/Portuguese, Dutch/German,
+# French, "Saint") that should stay glued to the last name rather than being
+# treated as a middle name, e.g. "de la Cruz", "van der Berg", "St. John".
+NAME_PARTICLES = {
+    "de", "del", "dela", "della", "der", "den", "des", "di", "do", "dos", "du",
+    "la", "las", "le", "les", "los", "van", "von", "st", "ter", "ten",
+}
+
+
+def split_person_name(raw: Optional[str]) -> dict:
+    """Split a person's name into first/middle/last, plus a normalized
+    "First Middle Last" full name. Handles both "Last, First Middle"
+    (comma-separated, common in institutional directories like a faculty
+    listing) and plain "First Middle Last" order, and keeps multi-word
+    "particle" surnames together (e.g. "de la Cruz") instead of splitting
+    them apart at the last space.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {"first_name": "", "middle_name": "", "last_name": "", "full_name": ""}
+
+    if "," in raw:
+        # "Last, First Middle" - the part before the comma is already the
+        # full (possibly multi-word) last name, no particle-scanning needed.
+        last_part, _, rest = raw.partition(",")
+        last_name = last_part.strip()
+        given_tokens = rest.split()
+    else:
+        tokens = raw.split()
+        if len(tokens) == 1:
+            return {"first_name": tokens[0], "middle_name": "", "last_name": "", "full_name": tokens[0]}
+        split_idx = len(tokens) - 1
+        while split_idx > 0 and tokens[split_idx - 1].lower().rstrip(".") in NAME_PARTICLES:
+            split_idx -= 1
+        last_name = " ".join(tokens[split_idx:])
+        given_tokens = tokens[:split_idx]
+
+    first_name = given_tokens[0] if given_tokens else ""
+    middle_name = " ".join(given_tokens[1:]) if len(given_tokens) > 1 else ""
+    full_name = " ".join(part for part in (first_name, middle_name, last_name) if part)
+    return {"first_name": first_name, "middle_name": middle_name, "last_name": last_name, "full_name": full_name}
+
+
+def extract_record(row: Tag, col_selectors: dict, split_name: bool = False) -> dict:
     record = {}
     for field_name, selector in col_selectors.items():
         el = row.select_one(selector) if selector else None
@@ -317,6 +361,8 @@ def extract_record(row: Tag, col_selectors: dict) -> dict:
             record[field_name] = el["title"].strip()
         else:
             record[field_name] = el.get_text(strip=True)
+    if split_name and "name" in record:
+        record.update(split_person_name(record["name"]))
     return record
 
 
@@ -346,7 +392,7 @@ def inspect(config: ScrapeConfig) -> dict:
         "row_count": len(rows),
         "col_selectors": col_selectors,
         "next_selector": next_selector,
-        "sample": [extract_record(r, col_selectors) for r in rows[:5]],
+        "sample": [extract_record(r, col_selectors, config.split_name) for r in rows[:5]],
     }
 
 
@@ -374,7 +420,7 @@ def scrape(config: ScrapeConfig) -> dict:
         html = fetch_html(url, config.render, config.wait)
         soup = BeautifulSoup(html, "html.parser")
         for row in soup.select(row_selector):
-            records.append(extract_record(row, col_selectors))
+            records.append(extract_record(row, col_selectors, config.split_name))
         pages += 1
 
         next_url = get_next_url(soup, next_selector, url)
@@ -426,6 +472,11 @@ def main() -> None:
     parser.add_argument("--row-selector")
     parser.add_argument("--next-selector")
     parser.add_argument("--inspect", action="store_true", help="preview detected selectors instead of scraping")
+    parser.add_argument(
+        "--split-name",
+        action="store_true",
+        help="split the detected 'name' field into first_name/middle_name/last_name/full_name",
+    )
     args = parser.parse_args()
 
     config = ScrapeConfig(
@@ -438,6 +489,7 @@ def main() -> None:
         wait=args.wait,
         row_selector=args.row_selector,
         next_selector=args.next_selector,
+        split_name=args.split_name,
     )
 
     if args.inspect:

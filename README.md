@@ -153,6 +153,15 @@ response instead of JSON.
 | `row_selector`  | `null`   | Override auto-detected row container                            |
 | `col_selectors` | `null`   | Override auto-detected `{field_name: selector}` map              |
 | `next_selector` | `null`   | Override auto-detected next-page link                           |
+| `split_name`    | `false`  | Split a `name` field into `first_name`/`middle_name`/`last_name`/`full_name` |
+
+`split_name` handles both "Last, First Middle" (comma-separated, common in
+institutional directories) and plain "First Middle Last" order, and keeps
+multi-word surname particles together (e.g. "de la Cruz", "van der Berg")
+instead of splitting them at the last space. It's off by default because not
+every `name` field is a person's name — e.g. a book title or business name —
+so turn it on when the directory is genuinely people (`{"split_name": true}`,
+`--split-name` on the CLI, or the checkbox on `/ui`).
 
 ## Notes
 
