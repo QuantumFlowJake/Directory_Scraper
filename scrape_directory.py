@@ -12,6 +12,7 @@ import csv
 import io
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urljoin
@@ -33,13 +34,132 @@ FIELD_HINTS = {
     "name": re.compile(r"name|title|company|business", re.IGNORECASE),
     "phone": re.compile(r"phone|tel", re.IGNORECASE),
     "email": re.compile(r"e[-]?mail", re.IGNORECASE),
-    "address": re.compile(r"address|location|city", re.IGNORECASE),
+    # negative lookbehinds keep classes like "cn-email-address" or
+    # "phone-address" (already claimed by the email/phone hint above) from
+    # also matching here just because "address" is a substring.
+    "address": re.compile(r"(?<!email-)(?<!e-mail-)(?<!mail-)(?<!phone-)address|location|city", re.IGNORECASE),
     # "link" alone is excluded: it's a common generic UI/styling class (e.g.
     # Bootstrap's "card-link", "nav-link") shared by unrelated anchors (map,
     # phone, email links), so it false-matches long before a genuinely
     # website-labeled element is reached.
     "website": re.compile(r"website|url", re.IGNORECASE),
 }
+
+# --- Output canonicalization -----------------------------------------------
+#
+# Auto-detected field names vary wildly by site (a plain "name" class here, a
+# fallback-named "notranslate_2" there), and raw values are often dirty -
+# concatenated with UI labels/type suffixes the source markup never actually
+# separated with whitespace (e.g. "Work Email:x@y.eduINTERNET"). Regardless of
+# what a given site's markup looks like, every scraped record is normalized
+# to lead with the same seven columns - first_name, middle_name, last_name,
+# title, email, phone, full_name - with clean values, followed by whatever
+# else was detected on the row.
+
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,6}\b")
+PHONE_RE = re.compile(
+    r"(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?:\s*(?:ext\.?|x|extension)\s*\d+)?",
+    re.IGNORECASE,
+)
+
+FULLNAME_KEY_RE = re.compile(r"full[_ ]?name", re.IGNORECASE)
+FAMILY_KEY_RE = re.compile(r"family|sur[_ ]?name|last[_ ]?name", re.IGNORECASE)
+GIVEN_KEY_RE = re.compile(r"given|first[_ ]?name", re.IGNORECASE)
+JOB_TITLE_KEY_RE = re.compile(r"job[_ ]?title|position|role|designation", re.IGNORECASE)
+
+# Content-based fallback for when a site's "title" field was actually claimed
+# by the person's full name (e.g. an unclassed heading link) and the real job
+# title ended up under a meaningless fallback key instead.
+JOB_TITLE_HINT_RE = re.compile(
+    r"\b(faculty|professor|instructor|lecturer|director|dean|chair|coordinator|"
+    r"specialist|manager|supervisor|administrator|assistant|associate|analyst|"
+    r"engineer|technician|officer|president|executive|counselor|advisor|"
+    r"librarian|registrar|provost|principal|representative)\b",
+    re.IGNORECASE,
+)
+
+
+def _first_regex_match(record: dict, pattern: re.Pattern) -> str:
+    for value in record.values():
+        if isinstance(value, str):
+            m = pattern.search(value)
+            if m:
+                return m.group(0)
+    return ""
+
+
+def _find_key(record: dict, pattern: re.Pattern, exclude: set = frozenset()) -> Optional[str]:
+    for key in record:
+        if key in exclude:
+            continue
+        if pattern.search(key):
+            return key
+    return None
+
+
+def _looks_like_person_name(value: str) -> bool:
+    words = value.replace(",", " ").split()
+    return 1 < len(words) <= 5 and not any(ch.isdigit() for ch in value)
+
+
+def canonicalize_record(record: dict) -> dict:
+    """Reshape a raw detected record into the fixed output column order,
+    scrubbing the leading email/phone columns of any label/type text the
+    source markup ran together with the actual value."""
+    email = _first_regex_match(record, EMAIL_RE)
+    phone = _first_regex_match(record, PHONE_RE)
+
+    full_key = _find_key(record, FULLNAME_KEY_RE)
+    family_key = _find_key(record, FAMILY_KEY_RE)
+    given_key = _find_key(record, GIVEN_KEY_RE, exclude={family_key} if family_key else set())
+
+    raw_full = ""
+    if full_key and record.get(full_key):
+        raw_full = record[full_key]
+    elif family_key and record.get(family_key):
+        given_value = record.get(given_key) if given_key else record.get("name", "")
+        raw_full = f"{given_value or ''} {record[family_key]}".strip()
+    elif record.get("name"):
+        raw_full = record["name"]
+    elif record.get("title") and _looks_like_person_name(record["title"]):
+        raw_full = record["title"]
+
+    name_parts = split_person_name(raw_full)
+
+    consumed = {k for k in (full_key, family_key, given_key, "name", "email", "phone") if k and k in record}
+
+    title_key = _find_key(record, JOB_TITLE_KEY_RE, exclude=consumed)
+    if title_key:
+        title = record.get(title_key) or ""
+        consumed.add(title_key)
+    elif record.get("title") and record["title"] != raw_full:
+        title = record["title"]
+        consumed.add("title")
+    else:
+        title = ""
+        for key, value in record.items():
+            if key in consumed or key == "title" or not isinstance(value, str):
+                continue
+            if JOB_TITLE_HINT_RE.search(value):
+                title = value
+                consumed.add(key)
+                break
+    # whichever branch resolved `title` above, the record's own "title" key
+    # (if any) is now fully represented by the canonical field - never let it
+    # re-appear as an extra column and clobber that resolved value below.
+    consumed.add("title")
+
+    canonical = {
+        "first_name": name_parts["first_name"],
+        "middle_name": name_parts["middle_name"],
+        "last_name": name_parts["last_name"],
+        "title": title,
+        "email": email,
+        "phone": phone,
+        "full_name": name_parts["full_name"] or raw_full,
+    }
+    canonical.update({k: v for k, v in record.items() if k not in consumed})
+    return canonical
 
 
 @dataclass
@@ -54,7 +174,6 @@ class ScrapeConfig:
     row_selector: Optional[str] = None
     col_selectors: Optional[dict] = None
     next_selector: Optional[str] = None
-    split_name: bool = False
 
 
 def fetch_html(url: str, render: bool, wait: Optional[str]) -> str:
@@ -336,7 +455,7 @@ def split_person_name(raw: Optional[str]) -> dict:
     return {"first_name": first_name, "middle_name": middle_name, "last_name": last_name, "full_name": full_name}
 
 
-def extract_record(row: Tag, col_selectors: dict, split_name: bool = False) -> dict:
+def _extract_raw_record(row: Tag, col_selectors: dict) -> dict:
     record = {}
     for field_name, selector in col_selectors.items():
         el = row.select_one(selector) if selector else None
@@ -361,9 +480,11 @@ def extract_record(row: Tag, col_selectors: dict, split_name: bool = False) -> d
             record[field_name] = el["title"].strip()
         else:
             record[field_name] = el.get_text(strip=True)
-    if split_name and "name" in record:
-        record.update(split_person_name(record["name"]))
     return record
+
+
+def extract_record(row: Tag, col_selectors: dict) -> dict:
+    return canonicalize_record(_extract_raw_record(row, col_selectors))
 
 
 def get_next_url(soup: BeautifulSoup, next_selector: Optional[str], current_url: str) -> Optional[str]:
@@ -373,6 +494,88 @@ def get_next_url(soup: BeautifulSoup, next_selector: Optional[str], current_url:
     if not el or not el.get("href"):
         return None
     return urljoin(current_url, el["href"])
+
+
+DATA_FEED_URL_RE = re.compile(
+    r"""(?:fetch|axios\.get|\$\.get|\.ajax)\(\s*["']([^"']+\.(?:xml|json))["']"""
+    r"""|url\s*[:=]\s*["']([^"']+\.(?:xml|json))["']""",
+    re.IGNORECASE,
+)
+
+
+def _iter_data_feed_urls(html: str, base_url: str):
+    """Some directories render an empty table client-side (DataTables and
+    similar) that fetches the real records from a companion XML/JSON feed
+    instead of ever putting them in the page's HTML - no amount of row/column
+    detection on the page itself will find them. Yield candidate feed URLs
+    found inline first, then in any linked <script src> - unrelated scripts
+    (analytics, trackers, ...) can coincidentally match the same pattern, so
+    callers should validate a candidate's actual content rather than trust
+    the first hit."""
+    seen: set = set()
+
+    def _emit(match: re.Match):
+        url = urljoin(base_url, match.group(1) or match.group(2))
+        if url not in seen:
+            seen.add(url)
+            return url
+        return None
+
+    for m in DATA_FEED_URL_RE.finditer(html):
+        url = _emit(m)
+        if url:
+            yield url
+
+    soup = BeautifulSoup(html, "html.parser")
+    for script in soup.find_all("script", src=True):
+        script_url = urljoin(base_url, script["src"])
+        try:
+            resp = requests.get(script_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException:
+            continue
+        for m in DATA_FEED_URL_RE.finditer(resp.text):
+            url = _emit(m)
+            if url:
+                yield url
+
+
+def _parse_xml_listing(xml_text: str) -> list[dict]:
+    """Flatten the most-repeated child element in an XML feed (e.g.
+    <listing><person>...</person>...) into one flat dict per item, keyed by
+    child tag name."""
+    root = ET.fromstring(xml_text)
+    tag_counts: dict[str, int] = {}
+    for el in root.iter():
+        if el is root:
+            continue
+        tag_counts[el.tag] = tag_counts.get(el.tag, 0) + 1
+    if not tag_counts:
+        return []
+    item_tag = max(tag_counts, key=tag_counts.get)
+    if tag_counts[item_tag] < 2:
+        return []
+
+    records = []
+    for item in root.iter(item_tag):
+        record = {}
+        for child in item:
+            key = re.sub(r"[^a-z0-9]+", "_", child.tag.lower()).strip("_") or "field"
+            record[key] = (child.text or "").strip()
+        if record:
+            records.append(record)
+    return records
+
+
+def _fetch_data_feed_records(feed_url: str) -> list[dict]:
+    resp = requests.get(feed_url, headers={"User-Agent": USER_AGENT}, timeout=30)
+    resp.raise_for_status()
+    if feed_url.lower().endswith(".json"):
+        data = resp.json()
+        if isinstance(data, dict):
+            data = next((v for v in data.values() if isinstance(v, list)), [])
+        return [dict(item) for item in data if isinstance(item, dict)]
+    return _parse_xml_listing(resp.text)
 
 
 def inspect(config: ScrapeConfig) -> dict:
@@ -385,6 +588,30 @@ def inspect(config: ScrapeConfig) -> dict:
 
     col_selectors = config.col_selectors or (detect_col_selectors(rows[0]) if rows else {})
     next_selector = config.next_selector or detect_next_selector(soup)
+    sample = [extract_record(r, col_selectors) for r in rows[:5]]
+
+    # Row detection found nothing usable (either no rows, or rows that carry
+    # no email/phone anywhere - a strong signal it locked onto page chrome
+    # rather than real listing content). Only worth the extra requests when
+    # the caller hasn't already pinned down selectors themselves.
+    looks_empty = not rows or not any(r.get("email") or r.get("phone") for r in sample)
+    if looks_empty and not config.row_selector and not config.col_selectors:
+        for feed_url in _iter_data_feed_urls(html, config.url):
+            try:
+                feed_records = _fetch_data_feed_records(feed_url)
+            except (requests.RequestException, ET.ParseError, ValueError):
+                continue
+            feed_sample = [canonicalize_record(r) for r in feed_records[:5]]
+            if any(r.get("email") or r.get("phone") for r in feed_sample):
+                return {
+                    "url": config.url,
+                    "row_selector": None,
+                    "row_count": len(feed_records),
+                    "col_selectors": None,
+                    "next_selector": None,
+                    "data_feed_url": feed_url,
+                    "sample": feed_sample,
+                }
 
     return {
         "url": config.url,
@@ -392,7 +619,7 @@ def inspect(config: ScrapeConfig) -> dict:
         "row_count": len(rows),
         "col_selectors": col_selectors,
         "next_selector": next_selector,
-        "sample": [extract_record(r, col_selectors, config.split_name) for r in rows[:5]],
+        "sample": sample,
     }
 
 
@@ -404,6 +631,18 @@ def scrape(config: ScrapeConfig) -> dict:
         next_selector = config.next_selector
     else:
         preview = inspect(config)
+        if preview.get("data_feed_url"):
+            records = [canonicalize_record(r) for r in _fetch_data_feed_records(preview["data_feed_url"])]
+            return {
+                "count": len(records),
+                "pages": 1,
+                "mode": "data_feed",
+                "records": records,
+                "row_selector": None,
+                "col_selectors": None,
+                "next_selector": None,
+                "data_feed_url": preview["data_feed_url"],
+            }
         row_selector = config.row_selector or preview["row_selector"]
         col_selectors = config.col_selectors or preview["col_selectors"]
         next_selector = config.next_selector or preview["next_selector"]
@@ -420,7 +659,7 @@ def scrape(config: ScrapeConfig) -> dict:
         html = fetch_html(url, config.render, config.wait)
         soup = BeautifulSoup(html, "html.parser")
         for row in soup.select(row_selector):
-            records.append(extract_record(row, col_selectors, config.split_name))
+            records.append(extract_record(row, col_selectors))
         pages += 1
 
         next_url = get_next_url(soup, next_selector, url)
@@ -472,11 +711,6 @@ def main() -> None:
     parser.add_argument("--row-selector")
     parser.add_argument("--next-selector")
     parser.add_argument("--inspect", action="store_true", help="preview detected selectors instead of scraping")
-    parser.add_argument(
-        "--split-name",
-        action="store_true",
-        help="split the detected 'name' field into first_name/middle_name/last_name/full_name",
-    )
     args = parser.parse_args()
 
     config = ScrapeConfig(
@@ -489,7 +723,6 @@ def main() -> None:
         wait=args.wait,
         row_selector=args.row_selector,
         next_selector=args.next_selector,
-        split_name=args.split_name,
     )
 
     if args.inspect:

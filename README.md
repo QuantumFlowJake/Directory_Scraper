@@ -153,15 +153,34 @@ response instead of JSON.
 | `row_selector`  | `null`   | Override auto-detected row container                            |
 | `col_selectors` | `null`   | Override auto-detected `{field_name: selector}` map              |
 | `next_selector` | `null`   | Override auto-detected next-page link                           |
-| `split_name`    | `false`  | Split a `name` field into `first_name`/`middle_name`/`last_name`/`full_name` |
 
-`split_name` handles both "Last, First Middle" (comma-separated, common in
-institutional directories) and plain "First Middle Last" order, and keeps
-multi-word surname particles together (e.g. "de la Cruz", "van der Berg")
-instead of splitting them at the last space. It's off by default because not
-every `name` field is a person's name — e.g. a book title or business name —
-so turn it on when the directory is genuinely people (`{"split_name": true}`,
-`--split-name` on the CLI, or the checkbox on `/ui`).
+## Output columns
+
+Every record is normalized to the same leading column order, regardless of
+how the source site is structured:
+
+```
+first_name, middle_name, last_name, title, email, phone, full_name, ...everything else detected on the row
+```
+
+- **Name splitting** handles both "Last, First Middle" (comma-separated,
+  common in institutional directories) and plain "First Middle Last" order,
+  and keeps multi-word surname particles together (e.g. "de la Cruz", "van
+  der Berg") instead of splitting them at the last space. It works whether
+  the site exposes a single full-name field or separate given/family-name
+  fields.
+- **`email`/`phone` are scrubbed**: sites often glue a label and type onto
+  the actual value with no separator (e.g. `Work Email:name@example.eduINTERNET`,
+  `Work Phone:555-123-4567ext.9work`). These columns always contain just the
+  address/number itself, extracted from wherever on the row it actually
+  appears — not the raw, label-prefixed text.
+- **`title`** is the person's job title/position, resolved from an
+  explicitly-hinted field when one exists, falling back to content matching
+  (e.g. "Faculty", "Director", "Coordinator", ...) for sites where the
+  detected `title` field actually captured the person's name instead.
+- Any additional fields the auto-detection found on the row (department,
+  address, a secondary phone type label, etc.) follow after `full_name`,
+  unchanged.
 
 ## Notes
 

@@ -50,7 +50,6 @@ class ScrapeRequest(BaseModel):
     row_selector: Optional[str] = None
     col_selectors: Optional[dict] = None
     next_selector: Optional[str] = None
-    split_name: bool = False
 
 
 class QuickScrapeRequest(BaseModel):
@@ -58,7 +57,6 @@ class QuickScrapeRequest(BaseModel):
     max_pages: int = 25
     delay: float = 1.0
     render: bool = False
-    split_name: bool = False
 
 
 class RunOverrides(BaseModel):
@@ -122,9 +120,7 @@ def health():
 def quick_scrape(req: QuickScrapeRequest):
     """One-shot scrape: give it a URL, get a CSV back. No profile, no
     manual selectors - uses the same auto-detection as /inspect."""
-    config = sd.ScrapeConfig(
-        url=req.url, max_pages=req.max_pages, delay=req.delay, render=req.render, split_name=req.split_name
-    )
+    config = sd.ScrapeConfig(url=req.url, max_pages=req.max_pages, delay=req.delay, render=req.render)
     try:
         result = sd.scrape(config)
     except Exception as exc:
@@ -161,9 +157,6 @@ follow pagination, and download a CSV of everything it finds.</p>
     <summary>Advanced</summary>
     <label>Max pages <input type="number" id="max_pages" value="25" min="1" style="width:5rem"></label>
     <label style="margin-left:1rem">Delay (sec) <input type="number" id="delay" value="1" min="0" step="0.5" style="width:5rem"></label>
-    <label style="display:block; margin-top:0.5rem">
-      <input type="checkbox" id="split_name"> Split "name" into first/middle/last/full name columns
-    </label>
   </details>
   <button type="submit">Scrape</button>
 </form>
@@ -176,14 +169,13 @@ form.addEventListener('submit', async (e) => {
   const url = document.getElementById('url').value;
   const max_pages = Number(document.getElementById('max_pages').value) || 25;
   const delay = Number(document.getElementById('delay').value) || 1;
-  const split_name = document.getElementById('split_name').checked;
   statusEl.className = '';
   statusEl.textContent = 'Scraping... this can take a while for many pages.';
   try {
     const resp = await fetch('/scrape', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url, max_pages, delay, split_name}),
+      body: JSON.stringify({url, max_pages, delay}),
     });
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
