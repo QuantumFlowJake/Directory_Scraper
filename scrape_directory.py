@@ -114,19 +114,36 @@ def canonicalize_record(record: dict) -> dict:
     given_key = _find_key(record, GIVEN_KEY_RE, exclude={family_key} if family_key else set())
 
     raw_full = ""
+    raw_full_key = None
     if full_key and record.get(full_key):
         raw_full = record[full_key]
+        raw_full_key = full_key
     elif family_key and record.get(family_key):
         given_value = record.get(given_key) if given_key else record.get("name", "")
         raw_full = f"{given_value or ''} {record[family_key]}".strip()
     elif record.get("name"):
         raw_full = record["name"]
+        raw_full_key = "name"
     elif record.get("title") and _looks_like_person_name(record["title"]):
         raw_full = record["title"]
+    else:
+        # Last resort: no field's *name* hinted at a person's name at all (a
+        # sort-key helper span, say, with a class like "hidden-sortable-data"
+        # that gives no semantic clue) - fall back to whichever field's
+        # *value* is shaped like one, first field wins.
+        for key, value in record.items():
+            if key in ("email", "phone") or not isinstance(value, str):
+                continue
+            if _looks_like_person_name(value):
+                raw_full = value
+                raw_full_key = key
+                break
 
     name_parts = split_person_name(raw_full)
 
-    consumed = {k for k in (full_key, family_key, given_key, "name", "email", "phone") if k and k in record}
+    consumed = {
+        k for k in (full_key, family_key, given_key, "name", "email", "phone", raw_full_key) if k and k in record
+    }
 
     title_key = _find_key(record, JOB_TITLE_KEY_RE, exclude=consumed)
     if title_key:
@@ -393,6 +410,50 @@ def detect_col_selectors(row: Tag) -> dict:
         name = name or (_name_from_class(c["cls"]) if c["cls"] else "title")
         assign(name, c["selector"])
 
+    if row.name == "tr":
+        for name, selector in _positional_table_fallback(row, cols).items():
+            assign(name, selector)
+
+    return cols
+
+
+def _positional_table_fallback(row: Tag, already_covered: dict) -> dict:
+    """Plain semantic tables (bare <td> cells, no `headers` attributes, no
+    classes at all) leave the descendant scan above with nothing to grab for
+    columns like a bare `<td>Some Dept</td>` or an unclassed mailto link -
+    there's no class/title hook anywhere in the cell. When a <thead> is
+    present, borrow its <th> labels and map them to <td>s by position,
+    skipping any <td> a selector above already reaches into (so an
+    already-correct match - e.g. a classed sort-key span - isn't replaced by
+    the noisier whole-cell text, which on some sites duplicates that same
+    value right next to it)."""
+    table = row.find_parent("table")
+    if table is None:
+        return {}
+    thead = table.find("thead")
+    header_cells = thead.find_all("th") if thead else []
+    tds = row.find_all("td", recursive=False)
+    if not header_cells or len(header_cells) != len(tds):
+        return {}
+
+    covered_indices = set()
+    for selector in already_covered.values():
+        el = row.select_one(selector)
+        if el is None:
+            continue
+        td_ancestor = el if el.name == "td" else el.find_parent("td")
+        if td_ancestor in tds:
+            covered_indices.add(tds.index(td_ancestor))
+
+    cols: dict[str, str] = {}
+    for idx, th in enumerate(header_cells):
+        if idx in covered_indices:
+            continue
+        label = th.get_text(strip=True)
+        if not label:
+            continue
+        name = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "field"
+        cols[name] = f"td:nth-child({idx + 1})"
     return cols
 
 
