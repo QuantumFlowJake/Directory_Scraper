@@ -28,7 +28,10 @@ except ImportError:
 
 USER_AGENT = "Mozilla/5.0 (compatible; DirectoryScraper/1.0)"
 
-NEXT_TEXT_PATTERN = re.compile(r"^\s*(next|»|>|more|older)[\s»›>→]*$", re.IGNORECASE)
+NEXT_TEXT_PATTERN = re.compile(
+    r"^\s*(next|»|>|more|older)\s*(?:page|entries|entry|results|records|posts)?[\s»›>→]*$",
+    re.IGNORECASE,
+)
 
 FIELD_HINTS = {
     "name": re.compile(r"name|title|company|business", re.IGNORECASE),
@@ -56,7 +59,16 @@ FIELD_HINTS = {
 # title, email, phone, full_name - with clean values, followed by whatever
 # else was detected on the row.
 
-EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[a-zA-Z]{2,6}\b")
+# Domain allows one-or-more dot-terminated labels (each may contain digits -
+# e.g. many US K-12 districts use a "district.k12.al.us"-style domain) ahead
+# of a final, letters-only TLD. That final TLD is deliberately capped at 6
+# chars with a trailing \b: source markup often runs a label/type suffix
+# straight into the address with no separator (e.g.
+# "Work Email:x@y.eduINTERNET"), and this length cap is what makes the
+# regex fail closed on that noise instead of greedily absorbing it - each
+# earlier label is unambiguously dot-terminated, so it carries no such risk
+# and doesn't need the same cap.
+EMAIL_RE = re.compile(r"[\w.+-]+@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,6}\b")
 PHONE_RE = re.compile(
     r"(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?:\s*(?:ext\.?|x|extension)\s*\d+)?",
     re.IGNORECASE,
@@ -268,17 +280,28 @@ def _table_row_selector(soup: BeautifulSoup, min_repeat: int) -> Optional[str]:
     return f"{table_part} tbody tr" if table.find("tbody") else f"{table_part} tr"
 
 
-def detect_row_selector(soup: BeautifulSoup, min_repeat: int) -> Optional[str]:
-    """Find the most common classed-tag signature that repeats at least min_repeat times.
+def detect_row_selector_candidates(soup: BeautifulSoup, min_repeat: int, limit: int = 5) -> list[str]:
+    """Rank candidate row selectors, most-repeated first.
 
     A "row" is expected to be a container of several fields, so plain inline
     tags (a, span, small, ...) are only used as a last resort: a directory
     listing's per-item links/labels usually outnumber the rows that wrap them,
     which would otherwise win on raw repeat count alone.
+
+    A table takes absolute priority when one exists. Beyond that, real-world
+    markup often adds an optional modifier class to only some otherwise-
+    identical rows (e.g. a "has-photo" class on the subset of staff with a
+    headshot), which fragments what's really one row type across multiple
+    class signatures and can let an unrelated but more uniformly-classed
+    element (e.g. a nav menu with no such variation) outrank it on raw repeat
+    count alone. Returning several ranked candidates - not just the top one -
+    lets the caller verify actual content (does a sample contain an
+    email/phone?) instead of betting everything on repeat count.
     """
+    candidates: list[str] = []
     table_selector = _table_row_selector(soup, min_repeat)
     if table_selector:
-        return table_selector
+        candidates.append(table_selector)
 
     counts: dict[str, int] = {}
     first_seen: dict[str, Tag] = {}
@@ -289,10 +312,8 @@ def detect_row_selector(soup: BeautifulSoup, min_repeat: int) -> Optional[str]:
         counts[sig] = counts.get(sig, 0) + 1
         first_seen.setdefault(sig, tag)
 
-    candidates = [(sig, n) for sig, n in counts.items() if n >= min_repeat]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[1], reverse=True)
+    ranked = [(sig, n) for sig, n in counts.items() if n >= min_repeat]
+    ranked.sort(key=lambda x: x[1], reverse=True)
 
     def is_container(sig: str) -> bool:
         tag_name = sig.partition(".")[0]
@@ -300,10 +321,25 @@ def detect_row_selector(soup: BeautifulSoup, min_repeat: int) -> Optional[str]:
             return False
         return len(first_seen[sig].find_all(True)) >= 1
 
-    containers = [c for c in candidates if is_container(c[0])]
-    sig = (containers or candidates)[0][0]
-    tag_name, _, cls = sig.partition(".")
-    return f"{tag_name}.{cls.replace(' ', '.')}" if cls else tag_name
+    containers = [c for c in ranked if is_container(c[0])]
+    for sig, _ in (containers or ranked):
+        tag_name, _, cls = sig.partition(".")
+        selector = f"{tag_name}.{cls.replace(' ', '.')}" if cls else tag_name
+        if selector not in candidates:
+            candidates.append(selector)
+        if len(candidates) >= limit:
+            break
+
+    return candidates
+
+
+def detect_row_selector(soup: BeautifulSoup, min_repeat: int) -> Optional[str]:
+    """Single best-guess row selector, for callers that just want one answer
+    (the CLI, external callers). inspect()/scrape() use
+    detect_row_selector_candidates() directly to try several ranked
+    candidates against actual content."""
+    candidates = detect_row_selector_candidates(soup, min_repeat, limit=1)
+    return candidates[0] if candidates else None
 
 
 def _name_from_class(cls: list[str]) -> str:
@@ -377,6 +413,24 @@ def _table_data_title_col_selectors(row: Tag) -> dict:
     return cols
 
 
+# Finalsite (a CMS widely used by US K-12 school districts) doesn't put an
+# email address in the HTML at all - it inserts one client-side via a call
+# like FS.util.insertEmail(elementId, reversedDomain, reversedLocalPart, ...),
+# with both string args stored backwards as a crude anti-scraping measure.
+FS_INSERT_EMAIL_RE = re.compile(r'FS\.util\.insertEmail\(\s*"[^"]*"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"')
+
+
+def _decode_fs_insert_email(el: Tag) -> Optional[str]:
+    for script in el.find_all("script"):
+        m = FS_INSERT_EMAIL_RE.search(script.get_text())
+        if not m:
+            continue
+        domain, local = m.group(1)[::-1], m.group(2)[::-1]
+        if domain and local:
+            return f"{local}@{domain}"
+    return None
+
+
 def detect_col_selectors(row: Tag) -> dict:
     """Guess field names for descendants of a row using common naming hints,
     falling back to the element's own class name (e.g. "author") rather than a
@@ -398,7 +452,12 @@ def detect_col_selectors(row: Tag) -> dict:
         text = child.get_text(strip=True)
         cls = child.get("class")
         title_attr = child.get("title")
-        if not text or len(text) > 200 or not (cls or title_attr):
+        # An element can carry real, extractable data with no visible text at
+        # all - e.g. Finalsite's obfuscated-email divs are empty until a
+        # client-side script fills them in - so a decodable script counts as
+        # content too, not just get_text().
+        has_content = bool(text) or bool(_decode_fs_insert_email(child))
+        if not has_content or len(text) > 200 or not (cls or title_attr):
             continue
 
         selector = _selector_for(child)
@@ -500,12 +559,35 @@ def _positional_table_fallback(row: Tag, already_covered: dict) -> dict:
     return cols
 
 
+# Matches "sr-only"/"srOnly"/"screen-reader-text"/"visually-hidden" etc. -
+# common accessibility conventions for a label meant for assistive tech only.
+SR_ONLY_CLASS_RE = re.compile(r"sr[-_]?only|screen-?reader|visually-?hidden|assistive", re.IGNORECASE)
+
+
+def _next_link_text(a: Tag) -> str:
+    """A "next" control is often a decorative icon/arrow (aria-hidden) glued
+    directly to a screen-reader-only label with no separator (e.g. an arrow
+    span plus a hidden "next page" span concatenating to ">next page"),
+    which the visible text alone can't be reliably pattern-matched against.
+    Prefer an aria-label, then any sr-only descendant's text, before falling
+    back to the anchor's raw visible text."""
+    aria_label = a.get("aria-label")
+    if aria_label:
+        return aria_label
+    sr_only = a.find(class_=SR_ONLY_CLASS_RE)
+    if sr_only:
+        text = sr_only.get_text(strip=True)
+        if text:
+            return text
+    return a.get_text(strip=True)
+
+
 def detect_next_selector(soup: BeautifulSoup) -> Optional[str]:
     a = soup.find("a", rel="next")
     if a and a.get("href"):
         return "a[rel='next']"
     for a in soup.find_all("a", href=True):
-        m = NEXT_TEXT_PATTERN.match(a.get_text(strip=True))
+        m = NEXT_TEXT_PATTERN.match(_next_link_text(a))
         if not m:
             continue
         cls = a.get("class")
@@ -592,7 +674,8 @@ def _extract_raw_record(row: Tag, col_selectors: dict) -> dict:
             # `title` commonly holds the untruncated label when visible text is elided
             record[field_name] = el["title"].strip()
         else:
-            record[field_name] = el.get_text(strip=True)
+            decoded_email = _decode_fs_insert_email(el)
+            record[field_name] = decoded_email if decoded_email else el.get_text(strip=True)
     return record
 
 
@@ -966,12 +1049,35 @@ def inspect(config: ScrapeConfig) -> dict:
     html = fetch_html(config.url, config.render, config.wait)
     soup = BeautifulSoup(html, "html.parser")
 
-    row_selector = config.row_selector or detect_row_selector(soup, config.min_repeat)
-    rows = soup.select(row_selector) if row_selector else []
+    if config.row_selector:
+        row_selector = config.row_selector
+        rows = soup.select(row_selector)
+        col_selectors = config.col_selectors or (detect_col_selectors(rows[0]) if rows else {})
+        sample = [extract_record(r, col_selectors) for r in rows[:5]]
+    else:
+        row_selector, rows, col_selectors, sample = None, [], {}, []
+        fallback = None
+        # Trying more candidates costs nothing but a little local CPU (no
+        # network calls, unlike the data-feed fallback below) - worth casting
+        # a wide net since single-field elements (a name heading, an email
+        # div) can coincidentally repeat exactly once per row too, pushing
+        # the real row container further down the ranking than 5.
+        for candidate in detect_row_selector_candidates(soup, config.min_repeat, limit=15):
+            candidate_rows = soup.select(candidate)
+            if not candidate_rows:
+                continue
+            candidate_cols = config.col_selectors or detect_col_selectors(candidate_rows[0])
+            candidate_sample = [extract_record(r, candidate_cols) for r in candidate_rows[:5]]
+            if fallback is None:
+                fallback = (candidate, candidate_rows, candidate_cols, candidate_sample)
+            if any(r.get("email") or r.get("phone") for r in candidate_sample):
+                row_selector, rows, col_selectors, sample = candidate, candidate_rows, candidate_cols, candidate_sample
+                break
+        else:
+            if fallback:
+                row_selector, rows, col_selectors, sample = fallback
 
-    col_selectors = config.col_selectors or (detect_col_selectors(rows[0]) if rows else {})
     next_selector = config.next_selector or detect_next_selector(soup)
-    sample = [extract_record(r, col_selectors) for r in rows[:5]]
 
     # Row detection found nothing usable (either no rows, or rows that carry
     # no email/phone anywhere - a strong signal it locked onto page chrome
