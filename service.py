@@ -50,6 +50,9 @@ class ScrapeRequest(BaseModel):
     row_selector: Optional[str] = None
     col_selectors: Optional[dict] = None
     next_selector: Optional[str] = None
+    solve_email: bool = False
+    reference_email: Optional[str] = None
+    reference_name: Optional[str] = None
 
 
 class QuickScrapeRequest(BaseModel):
@@ -57,6 +60,9 @@ class QuickScrapeRequest(BaseModel):
     max_pages: int = 25
     delay: float = 1.0
     render: bool = False
+    solve_email: bool = False
+    reference_email: Optional[str] = None
+    reference_name: Optional[str] = None
 
 
 class RunOverrides(BaseModel):
@@ -120,7 +126,15 @@ def health():
 def quick_scrape(req: QuickScrapeRequest):
     """One-shot scrape: give it a URL, get a CSV back. No profile, no
     manual selectors - uses the same auto-detection as /inspect."""
-    config = sd.ScrapeConfig(url=req.url, max_pages=req.max_pages, delay=req.delay, render=req.render)
+    config = sd.ScrapeConfig(
+        url=req.url,
+        max_pages=req.max_pages,
+        delay=req.delay,
+        render=req.render,
+        solve_email=req.solve_email,
+        reference_email=req.reference_email,
+        reference_name=req.reference_name,
+    )
     try:
         result = sd.scrape(config)
     except Exception as exc:
@@ -157,6 +171,13 @@ follow pagination, and download a CSV of everything it finds.</p>
     <summary>Advanced</summary>
     <label>Max pages <input type="number" id="max_pages" value="25" min="1" style="width:5rem"></label>
     <label style="margin-left:1rem">Delay (sec) <input type="number" id="delay" value="1" min="0" step="0.5" style="width:5rem"></label>
+    <label style="display:block; margin-top:0.5rem">
+      <input type="checkbox" id="solve_email"> Solve email format (adds a "solved_email" column when real addresses aren't scrapable)
+    </label>
+    <div id="reference_fields" style="display:none; margin-top:0.5rem">
+      <label>Known email <input type="text" id="reference_email" placeholder="jane.doe@example.com" style="width:14rem"></label>
+      <label style="margin-left:1rem">belongs to <input type="text" id="reference_name" placeholder="Jane Doe" style="width:10rem"></label>
+    </div>
   </details>
   <button type="submit">Scrape</button>
 </form>
@@ -164,18 +185,24 @@ follow pagination, and download a CSV of everything it finds.</p>
 <script>
 const form = document.getElementById('f');
 const statusEl = document.getElementById('status');
+document.getElementById('solve_email').addEventListener('change', (e) => {
+  document.getElementById('reference_fields').style.display = e.target.checked ? 'block' : 'none';
+});
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const url = document.getElementById('url').value;
   const max_pages = Number(document.getElementById('max_pages').value) || 25;
   const delay = Number(document.getElementById('delay').value) || 1;
+  const solve_email = document.getElementById('solve_email').checked;
+  const reference_email = document.getElementById('reference_email').value || null;
+  const reference_name = document.getElementById('reference_name').value || null;
   statusEl.className = '';
   statusEl.textContent = 'Scraping... this can take a while for many pages.';
   try {
     const resp = await fetch('/scrape', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url, max_pages, delay}),
+      body: JSON.stringify({url, max_pages, delay, solve_email, reference_email, reference_name}),
     });
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));

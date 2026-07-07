@@ -13,9 +13,9 @@ import io
 import re
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -191,6 +191,9 @@ class ScrapeConfig:
     row_selector: Optional[str] = None
     col_selectors: Optional[dict] = None
     next_selector: Optional[str] = None
+    solve_email: bool = False
+    reference_email: Optional[str] = None
+    reference_name: Optional[str] = None
 
 
 def fetch_html(url: str, render: bool, wait: Optional[str]) -> str:
@@ -338,6 +341,29 @@ def _table_col_selectors(row: Tag) -> dict:
     return cols
 
 
+def _table_data_title_col_selectors(row: Tag) -> dict:
+    """Some accessible tables label cells with `data-title` instead of
+    `headers`, and often mark the row's primary cell as a <th scope="row">
+    rather than a <td> (e.g. "Name" as the row heading) - scan both tag
+    types so that cell isn't silently dropped."""
+    cols: dict[str, str] = {}
+    used_names: set[str] = set()
+    for cell in row.find_all(["td", "th"]):
+        label = cell.get("data-title")
+        text = cell.get_text(strip=True)
+        if not label or not text:
+            continue
+        name = re.sub(r"[^a-z0-9]+", "_", label.strip().lower()).strip("_") or "field"
+        base_name = name
+        suffix = 2
+        while name in used_names:
+            name = f"{base_name}_{suffix}"
+            suffix += 1
+        used_names.add(name)
+        cols[name] = f'[data-title="{label}"]'
+    return cols
+
+
 def detect_col_selectors(row: Tag) -> dict:
     """Guess field names for descendants of a row using common naming hints,
     falling back to the element's own class name (e.g. "author") rather than a
@@ -348,6 +374,10 @@ def detect_col_selectors(row: Tag) -> dict:
     table_cols = _table_col_selectors(row)
     if table_cols:
         return table_cols
+
+    data_title_cols = _table_data_title_col_selectors(row)
+    if data_title_cols:
+        return data_title_cols
 
     candidates = []
     used_selectors = set()
@@ -462,7 +492,8 @@ def detect_next_selector(soup: BeautifulSoup) -> Optional[str]:
     if a and a.get("href"):
         return "a[rel='next']"
     for a in soup.find_all("a", href=True):
-        if not NEXT_TEXT_PATTERN.match(a.get_text(strip=True)):
+        m = NEXT_TEXT_PATTERN.match(a.get_text(strip=True))
+        if not m:
             continue
         cls = a.get("class")
         if cls:
@@ -470,6 +501,14 @@ def detect_next_selector(soup: BeautifulSoup) -> Optional[str]:
         parent = a.parent
         if parent and parent.get("class"):
             return f"{parent.name}.{'.'.join(parent['class'])} a"
+        # Plain semantic pagination (e.g. <nav><ul class="pager"><li><a>Next</a>)
+        # has no class anywhere nearby to build a selector from - fall back
+        # to matching by the anchor's own core text (just the matched
+        # keyword, e.g. "Next", not the full text - a following arrow glyph
+        # is decoration, not part of a stable match target).
+        keyword = m.group(1).strip().replace('"', "")
+        if keyword:
+            return f'a:-soup-contains("{keyword}")'
     return None
 
 
@@ -639,6 +678,249 @@ def _fetch_data_feed_records(feed_url: str) -> list[dict]:
     return _parse_xml_listing(resp.text)
 
 
+# --- Email format solving ---------------------------------------------------
+#
+# Some directories route every "Email" link through an obfuscated contact
+# form (e.g. /mail?to-email=<encrypted blob>) instead of a real mailto:, so
+# no address is ever directly scrapable. Many institutions still leak real,
+# plaintext addresses elsewhere on the same site (a department contact page,
+# a staff bio) that follow one consistent naming convention. When enabled,
+# this learns that convention from a handful of verified (name, email) pairs
+# and applies it to every record's first/last name as a best-effort
+# "solved_email" column - clearly separate from (and never overwriting) a
+# real scraped `email`.
+
+# Ranked most-to-least specific: a "Contact" link is far more likely to land
+# on a page with real (name, email) pairs than a generic "About"/"Board"
+# page, which are common enough on any site's nav to otherwise crowd out the
+# useful link before the crawl budget is reached.
+REFERENCE_PAGE_HINT_TIERS = [
+    re.compile(r"\bcontact\b", re.IGNORECASE),
+    re.compile(r"\bstaff\b|\bteam\b|\bleadership\b|\bpersonnel\b", re.IGNORECASE),
+    re.compile(r"\babout\b|\bboard\b|\badministration\b|\bmeet\b", re.IGNORECASE),
+]
+
+
+def _reference_page_score(text: str) -> int:
+    for rank, pattern in enumerate(REFERENCE_PAGE_HINT_TIERS):
+        if pattern.search(text):
+            return len(REFERENCE_PAGE_HINT_TIERS) - rank
+    return 0
+
+# (template id, first+last -> local-part) - ordered roughly by how common
+# each convention is, used as a tie-breaker when match rates are equal.
+EMAIL_TEMPLATES = [
+    ("first_initial_last", lambda f, l: f[:1] + l),
+    ("first_dot_last", lambda f, l: f"{f}.{l}"),
+    ("first_last", lambda f, l: f + l),
+    ("first_underscore_last", lambda f, l: f"{f}_{l}"),
+    ("last_first_initial", lambda f, l: l + f[:1]),
+    ("last_dot_first", lambda f, l: f"{l}.{f}"),
+    ("first", lambda f, l: f),
+    ("last", lambda f, l: l),
+]
+EMAIL_TEMPLATES_BY_ID = dict(EMAIL_TEMPLATES)
+
+
+def _normalize_name_part(value: str) -> str:
+    return re.sub(r"[^a-z]", "", (value or "").lower())
+
+
+def _last_name_variants(last: str) -> list[str]:
+    """Try the full surname first, then just its final segment - many sites
+    drop a hyphenated/multi-word surname's leading part for email purposes
+    (e.g. "Silva-Gradillas" -> "gradillas")."""
+    full = _normalize_name_part(last)
+    segment = _normalize_name_part(re.split(r"[\s-]", last or "")[-1])
+    variants = [v for v in (full, segment) if v]
+    seen = []
+    for v in variants:
+        if v not in seen:
+            seen.append(v)
+    return seen
+
+
+def _render_email_template(template_id: str, first: str, last: str) -> str:
+    f, l = _normalize_name_part(first), _normalize_name_part(last)
+    if not f or not l:
+        return ""
+    return EMAIL_TEMPLATES_BY_ID[template_id](f, l)
+
+
+def _find_reference_pages(html: str, base_url: str, limit: int = 5) -> list[str]:
+    """Same-domain links whose text/href suggest a staff/contact page - a
+    plausible place to find a real, unobfuscated (name, email) pair. Ranked
+    by specificity (see REFERENCE_PAGE_HINT_TIERS) rather than DOM order, so
+    a handful of generic "About"/"Board" nav links don't crowd out a much
+    more promising "Contact" link before the crawl budget runs out."""
+    soup = BeautifulSoup(html, "html.parser")
+    base_domain = urlparse(base_url).netloc
+    scored: list[tuple[int, str]] = []
+    seen: set = set()
+    for a in soup.find_all("a", href=True):
+        haystack = f"{a.get_text(strip=True)} {a['href']}"
+        score = _reference_page_score(haystack)
+        if score == 0:
+            continue
+        url = urljoin(base_url, a["href"])
+        if urlparse(url).netloc != base_domain or url in seen:
+            continue
+        seen.add(url)
+        scored.append((score, url))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [url for _, url in scored[:limit]]
+
+
+def _extract_name_email_pairs(html: str, domain: str) -> list[tuple[str, str]]:
+    """Best-effort scan of a page for (person name, real email) pairs. Looks
+    for a same-domain email as an element's own visible text (obfuscated
+    contact-form links still often show the real address as their link
+    text), then hunts the nearest container for something name-shaped: a
+    photo's alt text, a heading, or bold text."""
+    soup = BeautifulSoup(html, "html.parser")
+    domain_re = re.compile(rf"[\w.+-]+@{re.escape(domain)}", re.IGNORECASE)
+    pairs: list[tuple[str, str]] = []
+    seen_emails: set = set()
+
+    for text_node in soup.find_all(string=domain_re):
+        m = domain_re.search(text_node)
+        if not m:
+            continue
+        email = m.group(0).lower()
+        if email in seen_emails:
+            continue
+        parent = text_node.parent
+        if not isinstance(parent, Tag):
+            continue
+
+        container = parent
+        for _ in range(5):
+            if not isinstance(container.parent, Tag):
+                break
+            container = container.parent
+            if container.name in ("div", "li", "tr", "section", "article"):
+                break
+
+        name = None
+        img = container.find("img", alt=True)
+        if img and _looks_like_person_name(img["alt"]):
+            name = img["alt"].strip()
+        if not name:
+            for tag_name in ("h1", "h2", "h3", "h4", "h5", "strong", "b"):
+                candidate = container.find(tag_name)
+                if candidate:
+                    candidate_text = candidate.get_text(strip=True)
+                    if _looks_like_person_name(candidate_text):
+                        name = candidate_text
+                        break
+        if name:
+            seen_emails.add(email)
+            pairs.append((name, email))
+
+    return pairs
+
+
+def solve_email_format(config: ScrapeConfig) -> Optional[dict]:
+    """Learn this site's email convention from verified (name, email) pairs -
+    either a manually supplied reference, or auto-discovered from the
+    directory page itself and a handful of linked staff/contact pages. Picks
+    the template with the highest match rate across every pair found (not
+    just the first), so a single misleading example can't dominate."""
+    domain = urlparse(config.url).netloc
+    if domain.startswith("www."):
+        domain = domain[4:]
+
+    pairs: list[tuple[str, str]] = []
+    sources: list[str] = []
+    is_manual = bool(config.reference_email and config.reference_name)
+
+    if is_manual:
+        pairs.append((config.reference_name, config.reference_email.strip().lower()))
+        sources.append("manual reference")
+    else:
+        html = fetch_html(config.url, config.render, config.wait)
+        pairs.extend(_extract_name_email_pairs(html, domain))
+        if pairs:
+            sources.append(config.url)
+        for page_url in _find_reference_pages(html, config.url):
+            if len(pairs) >= 15:
+                break
+            try:
+                resp = requests.get(page_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+                resp.raise_for_status()
+            except requests.RequestException:
+                continue
+            found = _extract_name_email_pairs(resp.text, domain)
+            if found:
+                pairs.extend(found)
+                sources.append(page_url)
+
+    # A manual reference is a single trusted example the caller vouches for
+    # directly - don't demand the same corroborating volume auto-discovery
+    # needs to rule out a coincidental match.
+    if not pairs or (not is_manual and len(pairs) < 3):
+        return None
+
+    scored = []
+    for template_id, _ in EMAIL_TEMPLATES:
+        hits = 0
+        for name, email in pairs:
+            local_part = email.split("@")[0]
+            name_parts = split_person_name(name)
+            first, last = name_parts["first_name"], name_parts["last_name"]
+            if not first or not last:
+                continue
+            if any(
+                _render_email_template(template_id, first, variant) == local_part
+                for variant in _last_name_variants(last)
+            ):
+                hits += 1
+        scored.append((template_id, hits))
+
+    template_id, hits = max(scored, key=lambda x: x[1])
+    match_rate = hits / len(pairs)
+    if match_rate < 0.5:
+        return None
+
+    return {
+        "template": template_id,
+        "domain": domain,
+        "match_rate": round(match_rate, 2),
+        "reference_pairs": len(pairs),
+        "sources": sources,
+    }
+
+
+def apply_solved_email(record: dict, solved: dict) -> str:
+    first, last = record.get("first_name", ""), record.get("last_name", "")
+    if not first or not last:
+        return ""
+    for variant in _last_name_variants(last):
+        local_part = _render_email_template(solved["template"], first, variant)
+        if local_part:
+            return f"{local_part}@{solved['domain']}"
+    return ""
+
+
+def _insert_after(record: dict, after_key: str, new_key: str, value) -> dict:
+    result = {}
+    for k, v in record.items():
+        result[k] = v
+        if k == after_key:
+            result[new_key] = value
+    if new_key not in result:
+        result[new_key] = value
+    return result
+
+
+def _apply_email_solve(records: list[dict], config: ScrapeConfig) -> tuple[list[dict], Optional[dict]]:
+    if not config.solve_email:
+        return records, None
+    solved = solve_email_format(config)
+    value_fn = (lambda r: apply_solved_email(r, solved)) if solved else (lambda r: "")
+    return [_insert_after(r, "full_name", "solved_email", value_fn(r)) for r in records], solved
+
+
 def inspect(config: ScrapeConfig) -> dict:
     """Fetch a single page and report detected/overridden selectors plus a sample of rows."""
     html = fetch_html(config.url, config.render, config.wait)
@@ -664,6 +946,7 @@ def inspect(config: ScrapeConfig) -> dict:
                 continue
             feed_sample = [canonicalize_record(r) for r in feed_records[:5]]
             if any(r.get("email") or r.get("phone") for r in feed_sample):
+                feed_sample, email_solve = _apply_email_solve(feed_sample, config)
                 return {
                     "url": config.url,
                     "row_selector": None,
@@ -671,15 +954,18 @@ def inspect(config: ScrapeConfig) -> dict:
                     "col_selectors": None,
                     "next_selector": None,
                     "data_feed_url": feed_url,
+                    "email_solve": email_solve,
                     "sample": feed_sample,
                 }
 
+    sample, email_solve = _apply_email_solve(sample, config)
     return {
         "url": config.url,
         "row_selector": row_selector,
         "row_count": len(rows),
         "col_selectors": col_selectors,
         "next_selector": next_selector,
+        "email_solve": email_solve,
         "sample": sample,
     }
 
@@ -691,9 +977,12 @@ def scrape(config: ScrapeConfig) -> dict:
         col_selectors = config.col_selectors
         next_selector = config.next_selector
     else:
-        preview = inspect(config)
+        # solve_email runs once at the end over every scraped record - skip it
+        # on this internal selector-detection pass so it isn't done twice.
+        preview = inspect(replace(config, solve_email=False))
         if preview.get("data_feed_url"):
             records = [canonicalize_record(r) for r in _fetch_data_feed_records(preview["data_feed_url"])]
+            records, email_solve = _apply_email_solve(records, config)
             return {
                 "count": len(records),
                 "pages": 1,
@@ -703,6 +992,7 @@ def scrape(config: ScrapeConfig) -> dict:
                 "col_selectors": None,
                 "next_selector": None,
                 "data_feed_url": preview["data_feed_url"],
+                "email_solve": email_solve,
             }
         row_selector = config.row_selector or preview["row_selector"]
         col_selectors = config.col_selectors or preview["col_selectors"]
@@ -731,6 +1021,7 @@ def scrape(config: ScrapeConfig) -> dict:
         if pages < config.max_pages:
             time.sleep(config.delay)
 
+    records, email_solve = _apply_email_solve(records, config)
     return {
         "count": len(records),
         "pages": pages,
@@ -739,6 +1030,7 @@ def scrape(config: ScrapeConfig) -> dict:
         "row_selector": row_selector,
         "col_selectors": col_selectors,
         "next_selector": next_selector,
+        "email_solve": email_solve,
     }
 
 
@@ -772,6 +1064,13 @@ def main() -> None:
     parser.add_argument("--row-selector")
     parser.add_argument("--next-selector")
     parser.add_argument("--inspect", action="store_true", help="preview detected selectors instead of scraping")
+    parser.add_argument(
+        "--solve-email",
+        action="store_true",
+        help="learn the site's email format from verified reference pairs and add a solved_email column",
+    )
+    parser.add_argument("--reference-email", help="known-good email to seed the solver instead of auto-discovery")
+    parser.add_argument("--reference-name", help="the person --reference-email belongs to (required alongside it)")
     args = parser.parse_args()
 
     config = ScrapeConfig(
@@ -784,6 +1083,9 @@ def main() -> None:
         wait=args.wait,
         row_selector=args.row_selector,
         next_selector=args.next_selector,
+        solve_email=args.solve_email,
+        reference_email=args.reference_email,
+        reference_name=args.reference_name,
     )
 
     if args.inspect:

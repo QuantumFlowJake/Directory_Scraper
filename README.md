@@ -153,6 +153,41 @@ response instead of JSON.
 | `row_selector`  | `null`   | Override auto-detected row container                            |
 | `col_selectors` | `null`   | Override auto-detected `{field_name: selector}` map              |
 | `next_selector` | `null`   | Override auto-detected next-page link                           |
+| `solve_email`   | `false`  | Add a best-effort `solved_email` column (see below)              |
+| `reference_email` | `null` | A known-good email to seed the solver, instead of auto-discovery |
+| `reference_name`  | `null` | The person `reference_email` belongs to (required alongside it)  |
+
+## Email format solving
+
+Some directories route every "Email" link through an obfuscated contact-form
+proxy instead of a real `mailto:`, so no address is ever directly scrapable
+(e.g. `/mail?to-email=<encrypted blob>`). Setting `solve_email: true` adds a
+`solved_email` column (right after `full_name`, alongside but never
+overwriting a real scraped `email`) by learning the site's address
+convention and applying it to every record's name:
+
+1. **Reference discovery.** Looks for a real, unobfuscated `name@domain`
+   address on the directory page itself, then on a handful of same-domain
+   pages whose link text suggests a contact/staff/leadership page - ranked
+   by specificity so a generic "About" link doesn't crowd out a much more
+   useful "Contact" link. Finds the name for each address via a nearby photo
+   `alt` attribute, heading, or bold text.
+2. **Pattern inference.** Scores common conventions (`jdoe`, `jane.doe`,
+   `janedoe`, `doej`, ...) against every verified pair found - not just the
+   first - so one misleading or stale example can't dominate. Requires at
+   least 3 corroborating pairs and a ≥50% match rate to use a template at
+   all.
+3. **Manual override.** Auto-discovery is a shallow, same-site crawl - it
+   won't find a reference buried on an unlinked page. Pass `reference_email`
+   + `reference_name` (a pairing you already know to be correct, e.g. found
+   via a web search) to seed the solver directly instead.
+
+The response always includes an `email_solve` object (`null` if nothing
+usable was found) reporting the winning `template`, `domain`, `match_rate`,
+how many `reference_pairs` were checked, and their `sources` - so a `1.0`
+match rate off a single manual reference reads very differently from a
+`0.75` rate backed by a dozen auto-discovered pairs. Every `solved_email` is
+a guess, not a verified address - treat it accordingly.
 
 ## Output columns
 
