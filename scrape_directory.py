@@ -119,8 +119,21 @@ def canonicalize_record(record: dict) -> dict:
         raw_full = record[full_key]
         raw_full_key = full_key
     elif family_key and record.get(family_key):
-        given_value = record.get(given_key) if given_key else record.get("name", "")
-        raw_full = f"{given_value or ''} {record[family_key]}".strip()
+        last_value = record[family_key].strip()
+        if given_key:
+            raw_full = f"{record.get(given_key) or ''} {last_value}".strip()
+        else:
+            # No dedicated given-name field - "name" is the closest stand-in,
+            # but it may already be the *full* name (first + last), not just
+            # a first name. Appending last_value again would duplicate it
+            # (e.g. name="Jason Beardsley" + lastName="Beardsley" ->
+            # "Jason Beardsley Beardsley"), so only append when it isn't
+            # already there.
+            name_value = (record.get("name") or "").strip()
+            if name_value and name_value.lower().endswith(last_value.lower()):
+                raw_full = name_value
+            else:
+                raw_full = f"{name_value} {last_value}".strip()
     elif record.get("name"):
         raw_full = record["name"]
         raw_full_key = "name"
@@ -621,12 +634,30 @@ def _iter_data_feed_urls(html: str, base_url: str):
             return url
         return None
 
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Some table plugins wire the data endpoint straight onto the element
+    # via a data-* attribute rather than a <script> call at all, e.g.
+    # <table data-url="/api/directory.json">. Try this first - it's the
+    # most explicit, least ambiguous signal available.
+    for attr in ("data-url", "data-src", "data-source"):
+        for el in soup.find_all(attrs={attr: True}):
+            value = el[attr]
+            # Covers both a literal .../feed.json path and a query-driven
+            # handler like faculty.php?...&returntype=json with no real
+            # extension at all.
+            if not re.search(r"\bjson\b|\bxml\b", value, re.IGNORECASE):
+                continue
+            url = urljoin(base_url, value)
+            if url not in seen:
+                seen.add(url)
+                yield url
+
     for m in DATA_FEED_URL_RE.finditer(html):
         url = _emit(m)
         if url:
             yield url
 
-    soup = BeautifulSoup(html, "html.parser")
     for script in soup.find_all("script", src=True):
         script_url = urljoin(base_url, script["src"])
         try:
@@ -670,8 +701,17 @@ def _parse_xml_listing(xml_text: str) -> list[dict]:
 def _fetch_data_feed_records(feed_url: str) -> list[dict]:
     resp = requests.get(feed_url, headers={"User-Agent": USER_AGENT}, timeout=30)
     resp.raise_for_status()
-    if feed_url.lower().endswith(".json"):
-        data = resp.json()
+    # A query-string-driven endpoint (e.g. a `.php` handler taking
+    # `&returntype=json`) won't end in ".json" at all - the response's own
+    # Content-Type is the authoritative signal; the URL suffix is only a
+    # fallback for servers that don't set it usefully.
+    content_type = resp.headers.get("Content-Type", "").lower()
+    looks_json = "json" in content_type or feed_url.lower().endswith(".json") or "json" in feed_url.lower()
+    if looks_json:
+        try:
+            data = resp.json()
+        except ValueError:
+            return _parse_xml_listing(resp.text)
         if isinstance(data, dict):
             data = next((v for v in data.values() if isinstance(v, list)), [])
         return [dict(item) for item in data if isinstance(item, dict)]
