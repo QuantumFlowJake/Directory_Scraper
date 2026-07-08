@@ -15,7 +15,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, replace
 from typing import Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -166,9 +166,18 @@ def canonicalize_record(record: dict) -> dict:
 
     name_parts = split_person_name(raw_full)
 
-    consumed = {
-        k for k in (full_key, family_key, given_key, "name", "email", "phone", raw_full_key) if k and k in record
-    }
+    consumed = {k for k in (full_key, family_key, given_key, "name", raw_full_key, "email") if k and k in record}
+    # A bare digit extension with no area code (e.g. "2873") won't match
+    # PHONE_RE as a full number, but it's still genuinely useful raw data -
+    # keep it as a fallback rather than silently discarding it. Only do this
+    # for phone, not email: unlike a partial number, raw text left over when
+    # EMAIL_RE finds nothing is reliably just UI chrome (e.g. a "Email"
+    # screen-reader label on a masked contact-form link) with zero actual
+    # contact info, so there's nothing worth falling back to there.
+    if phone and "phone" in record:
+        consumed.add("phone")
+    elif "phone" in record and not any(ch.isdigit() for ch in (record.get("phone") or "")):
+        consumed.add("phone")
 
     title_key = _find_key(record, JOB_TITLE_KEY_RE, exclude=consumed)
     if title_key:
@@ -801,6 +810,77 @@ def _fetch_data_feed_records(feed_url: str) -> list[dict]:
     return _parse_xml_listing(resp.text)
 
 
+# --- Google Sheets as a data source ------------------------------------------
+#
+# A small department site sometimes backs its directory with a public Google
+# Sheet, fetched client-side via the Sheets API v4. Unlike the XML/JSON feed
+# patterns above, the request URL is never written out literally - it's
+# assembled at runtime from a spreadsheet id and API key declared as separate
+# variables (often even split across two different script files) - so the
+# usual literal-URL regex scan can't find it. The API key is also commonly
+# HTTP-referrer-restricted (a standard Google Cloud protection against key
+# theft), returning 403 unless the request's Referer header matches an
+# allowed page - exactly what a real browser loading the page would send.
+
+GOOGLE_API_KEY_RE = re.compile(r"AIza[0-9A-Za-z_-]{35}")
+GOOGLE_SHEET_TITLE_RE = re.compile(r"sheetTitles\s*:\s*\[\s*[\"']([^\"']+)[\"']")
+
+
+def _find_google_sheet_source(html: str, base_url: str) -> Optional[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    combined = html
+    for script in soup.find_all("script", src=True):
+        script_url = urljoin(base_url, script["src"])
+        try:
+            resp = requests.get(script_url, headers={"User-Agent": USER_AGENT}, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException:
+            continue
+        combined += "\n" + resp.text
+
+    if "sheets.googleapis.com" not in combined:
+        return None
+
+    key_match = GOOGLE_API_KEY_RE.search(combined)
+    if not key_match:
+        return None
+    api_key = key_match.group(0)
+
+    # The spreadsheet id has no distinctive prefix like the API key does -
+    # take the first other long alphanumeric-ish quoted literal in the same
+    # scripts as the best guess (this is how these tiny config scripts are
+    # conventionally written: an `id` constant declared right alongside the
+    # API key).
+    id_candidates = re.findall(r'["\']([a-zA-Z0-9_-]{30,60})["\']', combined)
+    sheet_id = next((c for c in id_candidates if c != api_key), None)
+    if not sheet_id:
+        return None
+
+    title_match = GOOGLE_SHEET_TITLE_RE.search(combined)
+    title = title_match.group(1) if title_match else "Sheet1"
+
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{quote(title)}?key={api_key}"
+    return {"url": url, "referer": base_url}
+
+
+def _fetch_google_sheet_records(source: dict) -> list[dict]:
+    resp = requests.get(
+        source["url"],
+        headers={"User-Agent": USER_AGENT, "Referer": source["referer"]},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    values = data.get("values") or []
+    if len(values) < 2:
+        return []
+    headers = [re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_") or "field" for h in values[0]]
+    records = []
+    for row in values[1:]:
+        records.append({headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))})
+    return records
+
+
 # --- Email format solving ---------------------------------------------------
 #
 # Some directories route every "Email" link through an obfuscated contact
@@ -1104,6 +1184,26 @@ def inspect(config: ScrapeConfig) -> dict:
                     "sample": feed_sample,
                 }
 
+        sheet_source = _find_google_sheet_source(html, config.url)
+        if sheet_source:
+            try:
+                sheet_records = _fetch_google_sheet_records(sheet_source)
+            except (requests.RequestException, ValueError):
+                sheet_records = []
+            sheet_sample = [canonicalize_record(r) for r in sheet_records[:5]]
+            if any(r.get("email") or r.get("phone") for r in sheet_sample):
+                sheet_sample, email_solve = _apply_email_solve(sheet_sample, config)
+                return {
+                    "url": config.url,
+                    "row_selector": None,
+                    "row_count": len(sheet_records),
+                    "col_selectors": None,
+                    "next_selector": None,
+                    "google_sheet_source": sheet_source,
+                    "email_solve": email_solve,
+                    "sample": sheet_sample,
+                }
+
     sample, email_solve = _apply_email_solve(sample, config)
     return {
         "url": config.url,
@@ -1138,6 +1238,20 @@ def scrape(config: ScrapeConfig) -> dict:
                 "col_selectors": None,
                 "next_selector": None,
                 "data_feed_url": preview["data_feed_url"],
+                "email_solve": email_solve,
+            }
+        if preview.get("google_sheet_source"):
+            records = [canonicalize_record(r) for r in _fetch_google_sheet_records(preview["google_sheet_source"])]
+            records, email_solve = _apply_email_solve(records, config)
+            return {
+                "count": len(records),
+                "pages": 1,
+                "mode": "google_sheet",
+                "records": records,
+                "row_selector": None,
+                "col_selectors": None,
+                "next_selector": None,
+                "google_sheet_source": preview["google_sheet_source"],
                 "email_solve": email_solve,
             }
         row_selector = config.row_selector or preview["row_selector"]
